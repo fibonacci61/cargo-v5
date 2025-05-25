@@ -62,7 +62,6 @@ unsafe fn set_upload_strategy_env_var(strategy: UploadStrategy) {
         UploadStrategy::Monolith => new_var.push_str("monolith\" "),
         UploadStrategy::Differential => new_var.push_str("differential\" "),
     }
-    println!("new RUSTFLAGS: {new_var}");
     unsafe {
         std::env::set_var("RUSTFLAGS", new_var);
     }
