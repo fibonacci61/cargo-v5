@@ -9,7 +9,9 @@ use cargo_metadata::{
 use clap::Args;
 use fs_err::tokio as fs;
 
+use super::upload::UploadStrategy;
 use crate::errors::CliError;
+use crate::metadata::{find_pkg, Metadata};
 
 pub const TARGET_PATH: &str = "armv7a-vex-v5.json";
 
@@ -53,10 +55,24 @@ async fn has_wasm_target() -> bool {
     rustup.contains("wasm32-unknown-unknown")
 }
 
+unsafe fn set_upload_strategy_env_var(strategy: UploadStrategy) {
+    let mut new_var = std::env::var("RUSTFLAGS").unwrap_or_default();
+    new_var.push_str(" --cfg vexide_upload_strategy=\"");
+    match strategy {
+        UploadStrategy::Monolith => new_var.push_str("monolith\" "),
+        UploadStrategy::Differential => new_var.push_str("differential\" "),
+    }
+    println!("new RUSTFLAGS: {new_var}");
+    unsafe {
+        std::env::set_var("RUSTFLAGS", new_var);
+    }
+}
+
 pub async fn build(
     path: &Utf8Path,
     opts: CargoOpts,
     for_simulator: bool,
+    upload_strategy: Option<UploadStrategy>,
 ) -> miette::Result<Option<Utf8PathBuf>> {
     let target_path = path.join(TARGET_PATH);
     let mut build_cmd = std::process::Command::new(cargo_bin());
@@ -106,6 +122,25 @@ pub async fn build(
     }
 
     build_cmd.args(opts.args);
+
+    let upload_strategy = match upload_strategy {
+        Some(strategy) => strategy,
+        None => {
+            let metadata = if let Some(pkg) = find_pkg() {
+                Some(Metadata::new(&pkg)?)
+            } else {
+                None
+            };
+
+            metadata
+                .and_then(|metadata| metadata.upload_strategy)
+                .unwrap_or_default()
+        }
+    };
+
+    unsafe {
+        set_upload_strategy_env_var(upload_strategy);
+    }
 
     Ok(block_in_place::<_, Result<Option<Utf8PathBuf>, CliError>>(
         || {

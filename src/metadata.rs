@@ -26,6 +26,30 @@ pub struct Metadata {
     pub upload_strategy: Option<UploadStrategy>,
 }
 
+pub fn find_pkg() -> Option<Package> {
+    // We'll use `cargo-metadata` to parse the output of `cargo metadata` and find valid `Cargo.toml`
+    // files in the workspace directory.
+    let cargo_metadata =
+        tokio::task::block_in_place(|| cargo_metadata::MetadataCommand::new().no_deps().exec())
+            .ok();
+
+    // Locate packages with valid v5 metadata fields.
+    cargo_metadata.and_then(|metadata| {
+        metadata
+            .packages
+            .iter()
+            .find(|pkg| {
+                if let Some(v5_metadata) = pkg.metadata.get("v5") {
+                    v5_metadata.is_object()
+                } else {
+                    false
+                }
+            })
+            .cloned()
+            .or(metadata.packages.first().cloned())
+    })
+}
+
 impl Metadata {
     pub fn new(pkg: &Package) -> Result<Self, CliError> {
         if let Some(metadata) = pkg.metadata.as_object() {

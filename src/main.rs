@@ -156,7 +156,7 @@ async fn app(command: Command, path: Utf8PathBuf, logger: &mut LoggerHandle) -> 
             simulator,
             cargo_opts,
         } => {
-            build(&path, cargo_opts, simulator).await?;
+            build(&path, cargo_opts, simulator, None).await?;
         }
         Command::Upload { upload_opts, after } => {
             upload(&path, upload_opts, after).await?;

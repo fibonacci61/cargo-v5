@@ -39,7 +39,7 @@ use vex_v5_serial::{
 use crate::{
     connection::{open_connection, switch_radio_channel},
     errors::CliError,
-    metadata::Metadata,
+    metadata::{find_pkg, Metadata},
 };
 
 use super::build::{build, objcopy, CargoOpts};
@@ -581,35 +581,17 @@ pub async fn upload(
     }: UploadOpts,
     after: AfterUpload,
 ) -> miette::Result<SerialConnection> {
-    // We'll use `cargo-metadata` to parse the output of `cargo metadata` and find valid `Cargo.toml`
-    // files in the workspace directory.
-    let cargo_metadata =
-        block_in_place(|| cargo_metadata::MetadataCommand::new().no_deps().exec()).ok();
-
-    // Locate packages with valid v5 metadata fields.
-    let package = cargo_metadata.and_then(|metadata| {
-        metadata
-            .packages
-            .iter()
-            .find(|p| {
-                if let Some(v5_metadata) = p.metadata.get("v5") {
-                    v5_metadata.is_object()
-                } else {
-                    false
-                }
-            })
-            .cloned()
-            .or(metadata.packages.first().cloned())
-    });
-
-    // Uploading has the option to use the `package.metadata.v5` table for default configuration options.
-    // Attempt to serialize `package.metadata.v5` into a [`Metadata`] struct. This will just Default::default to
-    // all `None`s if it can't find a specific field, or error if the field is malformed.
-    let metadata = if let Some(ref package) = package {
-        Some(Metadata::new(package)?)
+    let pkg = find_pkg();
+    let metadata = if let Some(ref pkg) = pkg {
+        Some(Metadata::new(pkg)?)
     } else {
         None
     };
+
+    let metadata_strategy = metadata
+        .and_then(|metadata| metadata.upload_strategy)
+        .unwrap_or_default();
+    let upload_strategy = upload_strategy.unwrap_or(metadata_strategy);
 
     // Try to open a serialport in the background while we build.
     let connection_task = spawn(open_connection());
@@ -619,7 +601,17 @@ pub async fn upload(
     // The user either directly passed an file through the `--file` argument, or they didn't and we need to run
     // `cargo build`.
     let artifact = if let Some(file) = file {
-        if file.extension() == Some("bin") {
+        // A rebuild is needed if the strategy in `metadata_strategy` differs from that in
+        // `upload_strategy`.
+
+        // If `metadata_strategy` is Differential and `upload_strategy` is Monolithic, this will
+        // "remove" the patcher.
+        // However, if `metadata_strategy` is Monolithic and `upload_strategy` is Differential, this
+        // will "add" in the patcher.
+        if metadata_strategy != upload_strategy {
+            // Run cargo build, then objcopy.
+            build(path, cargo_opts, false, Some(upload_strategy)).await?
+        } else if file.extension() == Some("bin") {
             Some(file)
         } else {
             // If a BIN file wasn't provided, we'll attempt to objcopy it as if it were an ELF.
@@ -640,7 +632,7 @@ pub async fn upload(
         }
     } else {
         // Run cargo build, then objcopy.
-        build(path, cargo_opts, false).await?
+        build(path, cargo_opts, false, Some(upload_strategy)).await?
     };
 
     // Wait for the serial port to finish opening.
@@ -681,10 +673,10 @@ pub async fn upload(
         &artifact.ok_or(CliError::NoArtifact)?,
         after,
         slot,
-        name.or(package.as_ref().map(|pkg| pkg.name.clone()))
+        name.or(pkg.as_ref().map(|pkg| pkg.name.clone()))
             .unwrap_or("cargo-v5".to_string()),
         description
-            .or(package.as_ref().and_then(|pkg| pkg.description.clone()))
+            .or(pkg.as_ref().and_then(|pkg| pkg.description.clone()))
             .unwrap_or("Uploaded with cargo-v5.".to_string()),
         icon.or(metadata.and_then(|metadata| metadata.icon))
             .unwrap_or_default(),
@@ -696,9 +688,7 @@ pub async fn upload(
                 .unwrap_or(true),
         },
         cold,
-        upload_strategy
-            .or(metadata.and_then(|metadata| metadata.upload_strategy))
-            .unwrap_or_default(),
+        upload_strategy,
     )
     .await?;
 
