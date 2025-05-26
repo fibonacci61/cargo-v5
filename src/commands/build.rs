@@ -71,6 +71,8 @@ pub async fn build(
     path: &Utf8Path,
     opts: CargoOpts,
     for_simulator: bool,
+    // Determines whether or not the patcher code is compiled in or not. If set to `None`, the
+    // strategy in the package metadata will be used.
     upload_strategy: Option<UploadStrategy>,
 ) -> miette::Result<Option<Utf8PathBuf>> {
     let target_path = path.join(TARGET_PATH);
@@ -123,7 +125,9 @@ pub async fn build(
     build_cmd.args(opts.args);
 
     let upload_strategy = match upload_strategy {
+        // Use if supplied
         Some(strategy) => strategy,
+        // Else, grab from metadata
         None => {
             let metadata = if let Some(pkg) = find_pkg() {
                 Some(Metadata::new(&pkg)?)

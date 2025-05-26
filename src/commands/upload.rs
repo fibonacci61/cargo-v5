@@ -6,7 +6,7 @@ use inquire::{
     validator::{ErrorMessage, Validation},
     CustomType,
 };
-use tokio::{fs::File, io::AsyncWriteExt, spawn, sync::Mutex, task::block_in_place, time::Instant};
+use tokio::{fs::File, io::AsyncWriteExt, spawn, sync::Mutex, time::Instant};
 
 use std::{
     io::{ErrorKind, Write},
@@ -302,7 +302,6 @@ pub async fn upload_program(
         }
         UploadStrategy::Differential => {
             let base_file_name = format!("slot_{}.base.bin", slot);
-
             let mut base = match tokio::fs::read(&path.with_file_name(&base_file_name)).await {
                 Ok(contents) => Some(contents),
                 Err(e) if e.kind() == ErrorKind::NotFound => None,
@@ -588,56 +587,6 @@ pub async fn upload(
         None
     };
 
-    let metadata_strategy = metadata
-        .and_then(|metadata| metadata.upload_strategy)
-        .unwrap_or_default();
-    let upload_strategy = upload_strategy.unwrap_or(metadata_strategy);
-
-    // Try to open a serialport in the background while we build.
-    let connection_task = spawn(open_connection());
-
-    // Get the build artifact we'll be uploading with.
-    //
-    // The user either directly passed an file through the `--file` argument, or they didn't and we need to run
-    // `cargo build`.
-    let artifact = if let Some(file) = file {
-        // A rebuild is needed if the strategy in `metadata_strategy` differs from that in
-        // `upload_strategy`.
-
-        // If `metadata_strategy` is Differential and `upload_strategy` is Monolithic, this will
-        // "remove" the patcher.
-        // However, if `metadata_strategy` is Monolithic and `upload_strategy` is Differential, this
-        // will "add" in the patcher.
-        if metadata_strategy != upload_strategy {
-            // Run cargo build, then objcopy.
-            build(path, cargo_opts, false, Some(upload_strategy)).await?
-        } else if file.extension() == Some("bin") {
-            Some(file)
-        } else {
-            // If a BIN file wasn't provided, we'll attempt to objcopy it as if it were an ELF.
-            let binary = objcopy(
-                &tokio::fs::read(&file)
-                    .await
-                    .map_err(|e| CliError::IoError(e))?,
-            )?;
-            let binary_path = file.with_extension("bin");
-
-            // Write the binary to a file.
-            tokio::fs::write(&binary_path, binary)
-                .await
-                .map_err(|e| CliError::IoError(e))?;
-            println!("     \x1b[1;92mObjcopy\x1b[0m {}", binary_path);
-
-            Some(binary_path)
-        }
-    } else {
-        // Run cargo build, then objcopy.
-        build(path, cargo_opts, false, Some(upload_strategy)).await?
-    };
-
-    // Wait for the serial port to finish opening.
-    let mut connection = connection_task.await.unwrap()?;
-
     // The program's slot number is absolutely required for uploading. If the slot argument isn't directly provided:
     //
     // - Check for the `package.metadata.v5.slot` field in Cargo.toml.
@@ -663,6 +612,79 @@ pub async fn upload(
     if !(1..=8).contains(&slot) {
         Err(CliError::SlotOutOfRange)?;
     }
+
+    let upload_strategy = upload_strategy.unwrap_or_else(|| {
+        metadata
+            .and_then(|metadata| metadata.upload_strategy)
+            .unwrap_or_default()
+    });
+
+    // Try to open a serialport in the background while we build.
+    let connection_task = spawn(open_connection());
+
+    // Get the build artifact we'll be uploading with.
+    //
+    // The user either directly passed an file through the `--file` argument, or either they didn't
+    // and we need to run `cargo build`, or the upload strategy in the build doesn't match our
+    // upload strategy, and we still need to rebuild.
+    let artifact = if let Some(file) = file {
+        let base_file = file.with_file_name(format!("slot_{slot}.base.bin"));
+
+        let patcher_built = match tokio::fs::try_exists(&base_file).await {
+            Ok(true) => true,
+            Ok(false) => {
+                // Remove broken symlink
+                tokio::fs::remove_file(&base_file)
+                    .await
+                    .map_err(CliError::IoError)?;
+                false
+            }
+            Err(_) => false,
+        };
+
+        // If we can't use this build with the current upload strategy:
+        if patcher_built
+            != match upload_strategy {
+                UploadStrategy::Monolith => false,
+                UploadStrategy::Differential => true,
+            }
+        {
+            if upload_strategy == UploadStrategy::Monolith {
+                // Remove base file so that future uploads don't think this is a patcher build.
+                tokio::fs::remove_file(base_file)
+                    .await
+                    .map_err(CliError::IoError)?;
+            }
+
+            build(path, cargo_opts, false, Some(upload_strategy)).await?
+        // If we can use it and the file is a BIN:
+        } else if file.extension() == Some("bin") {
+            Some(file)
+        // If we can use it but it's not a BIN:
+        } else {
+            // If a BIN file wasn't provided, we'll attempt to objcopy it as if it were an ELF.
+            let binary = objcopy(
+                &tokio::fs::read(&file)
+                    .await
+                    .map_err(|e| CliError::IoError(e))?,
+            )?;
+            let binary_path = file.with_extension("bin");
+
+            // Write the binary to a file.
+            tokio::fs::write(&binary_path, binary)
+                .await
+                .map_err(|e| CliError::IoError(e))?;
+            println!("     \x1b[1;92mObjcopy\x1b[0m {}", binary_path);
+
+            Some(binary_path)
+        }
+    } else {
+        // Run cargo build, then objcopy.
+        build(path, cargo_opts, false, Some(upload_strategy)).await?
+    };
+
+    // Wait for the serial port to finish opening.
+    let mut connection = connection_task.await.unwrap()?;
 
     // Switch the radio to the download channel if the controller is wireless.
     switch_radio_channel(&mut connection, RadioChannel::Download).await?;
